@@ -1,9 +1,14 @@
 ---
 name: organize-codex-task-titles
-description: Standardize and safely rename Codex task titles with color-block, semantic-icon, or explicit custom markers plus a domain, project or repository key, work type, and concrete object-plus-purpose summary. Use for current-task title checkpoints, manual title cleanup, cross-repository batch normalization, marker migration, NO-ID migration, or recurring title maintenance. Private projects without Jira or Gerrit should use the project name, repository name, or cwd basename.
+description: Standardize and safely rename Codex task titles with color-block, semantic-icon, or explicit custom markers plus a domain, project or repository key, work type, and concrete object-plus-purpose summary. Use for current-task title checkpoints, Stop recovery notices, manual title cleanup, cross-repository batch normalization, marker migration, NO-ID migration, or recurring title maintenance. Private projects without Jira or Gerrit should use the project name, repository name, or cwd basename.
 ---
 
 # Organize Codex task titles
+
+Run title maintenance only from the main agent of a persistent task. If you are
+a subagent or are in a side or ephemeral conversation, skip this skill, including
+inherited checkpoints and Stop recovery notices. Do not rename your own thread
+or its parent task.
 
 ## Build the title
 
@@ -80,26 +85,41 @@ Never infer a client identity, project name, or issue key from unrelated tasks.
 
 ## Current-task checkpoint mode
 
-When developer context identifies a plugin checkpoint, finish the user's main
-request first, then run this section before ending the same foreground turn. Do
-not enter the batch workflow:
+When Hook context requests a plugin checkpoint or a title-confirmation recovery,
+finish the user's main request first, then run this section before ending the
+same foreground turn. Do not enter the batch workflow:
 
 1. Generate the title only from the current task context. Do not call
    `list_threads`, `read_thread`, or an automation tool, except for the narrow
    post-rename sidebar routing flow explicitly enabled by Hook context.
+   Do not inspect persisted prompts, transcripts, rollouts, Codex databases, or
+   session files, and do not use UI automation.
 2. The current task may be active. Call `set_thread_title` without a `threadId`
    so only the calling task is targeted.
 3. Prefer the current project/repository identifier or `cwd` basename over an
    activity date when no Jira/Gerrit key exists.
 4. At the first checkpoint, establish a useful title. At an intermediate
    checkpoint, refine only when the title is missing, inaccurate, or materially
-   clearer context is now available. At the final checkpoint, rename only when
-   the project, work type, object, or purpose changed materially.
+   clearer context is now available. At the final checkpoint, review the title
+   and write the intended value once even if it is unchanged. The successful
+   receipt completes automatic title maintenance for this task.
 5. Act only on a confirmed Codex task. If task kind or tool availability cannot
-   be confirmed, skip quietly. Do not create a task, send a follow-up, inspect
-   internal files, or use UI automation as a workaround.
+   be confirmed, skip the write. At a normal checkpoint, skip quietly; during a
+   Stop recovery, briefly report the limitation. Do not create a task, send a
+   follow-up, or inspect internal files as a workaround.
 6. Treat title maintenance as secondary. Do not add a maintenance report unless
    a failure affects the user's decision.
+
+When Hook context identifies **Stop recovery**, including a brief notice linking
+to this skill, make one current-task title write even if
+the intended title already matches the existing wording. This confirms the
+requested value and overrides the optional refinement skip above.
+Verify the tool returned the current task ID and intended title. If the call
+fails, report the failure briefly and finish; do not retry or restart the main
+request in that continuation. After success, end without a separate
+title-maintenance announcement. The Hook stores counters and confirmation flags
+in its own SQLite database, never title text. After the final required write
+succeeds, it clears the detailed state and retains only a completion marker.
 
 ## Sidebar section routing
 
@@ -191,8 +211,11 @@ unless the user explicitly requests that broader scope.
 
 ## Recurring maintenance
 
-The plugin Hook covers only the current active task at its checkpoints. It does
-not retroactively rename old tasks.
+The plugin Hook covers the current active task at its checkpoints and provides
+one automatic Stop recovery per checkpoint when a title write remains
+unconfirmed. If the tool is unavailable or recovery fails, finish normally and
+wait for a later checkpoint or an explicit manual request. Resuming a task does
+not renew an exhausted checkpoint's allowance. Idle old tasks are never scanned.
 
 When the user explicitly asks for recurring batch cleanup, prefer updating an
 existing automation instead of creating a duplicate. Preserve its schedule,

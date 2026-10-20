@@ -23,15 +23,51 @@ list` and reuse it instead of creating a duplicate.
 
 ## Required review
 
-1. Verify Python 3 with `py -3 --version` on Windows or `python3 --version` on
-   macOS/Linux.
-2. Refresh or restart Codex and start a new task.
-3. Open `/hooks`, inspect the `UserPromptSubmit` and exact `PostToolUse`
-   commands, and trust them.
+1. Verify Python 3 with its standard `sqlite3` module: use
+   `py -3 -c "import sqlite3; print(sqlite3.sqlite_version)"` on Windows or
+   `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"` on macOS/Linux.
+2. Open `/hooks`, inspect the `UserPromptSubmit`, exact title-tool `PostToolUse`,
+   and `Stop` commands, and trust them. Upgrading requires review of the new Stop
+   handler and any changed matcher.
+3. Refresh the configuration in the Codex instance running your tasks. For an
+   existing task, follow the runtime refresh guidance below. Restart only when
+   it will not interrupt active work.
 4. The counter begins when the enabled and trusted plugin first observes a
    prompt in that task session.
 
 Do not claim the automatic checkpoints are active before the Hook is trusted.
+
+### Applying upgrades to existing tasks
+
+Hook definitions and trust changes must reach the app-server hosting the task.
+When using the native API, connect to that running server and confirm the task
+appears in `thread/loaded/list`. After reviewing and trusting the upgraded Hook,
+request `config/batchWrite` with these parameters to refresh loaded tasks without
+changing configuration values:
+
+```json
+{"edits": [], "reloadUserConfig": true}
+```
+
+Sending this request to a separate verification app-server refreshes only that
+process. A successful `hooks/list` result confirms the definitions and trust
+records it reads; it does not verify that an existing task has applied them.
+
+Validate an existing task through its next real title-tool success and the
+following Stop. The plugin should record the successful result and let Stop
+finish without a recovery prompt. At or after the final checkpoint, its own
+SQLite row becomes `done = 1, state_json = NULL`. Earlier checkpoints retain
+`title_write_confirmed = true` until the final checkpoint. Previously missed
+receipts are not reconstructed, so a task may request one confirmation before
+the refreshed observer receives its first successful call. Keep the validation
+read-only; never insert a completion record to make it pass.
+
+State is stored in the plugin's own `title-state.sqlite3`, separate
+from Codex's databases. Existing per-task JSON state is imported as each task
+resumes; the files remain unchanged for rollback. After the final check succeeds,
+only a completion marker remains in SQLite and that task no longer triggers
+automatic title checks. A rollback uses the older JSON snapshot and cannot
+restore progress recorded only in SQLite.
 
 ## Migrating from codex-personal-skills
 

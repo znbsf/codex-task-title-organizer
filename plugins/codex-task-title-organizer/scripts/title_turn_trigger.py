@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Emit title-maintenance context without reading prompt or title tool payloads."""
+"""Request title maintenance and verify receipts without persisting title text."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import sqlite3
 import sys
-import time
-from contextlib import contextmanager
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 
 DEFAULT_CHECKPOINTS = (2, 4, 10)
@@ -39,8 +39,17 @@ MAX_ROUTED_DOMAIN_LENGTH = 40
 MAX_SECTION_DOMAIN_MAPPINGS = 16
 MAX_SEEN_TURNS = 64
 MAX_TITLE_TOOL_COMPLETION_OBSERVATIONS = MAX_CHECKPOINTS
-SCHEMA_VERSION = 5
-TITLE_TOOL_NAME = "mcp__codex_app__set_thread_title"
+SCHEMA_VERSION = 7
+STATE_DATABASE_NAME = "title-state.sqlite3"
+TITLE_TOOL_NAMES = (
+    "mcp__codex_app__set_thread_title",
+    "codex_app__set_thread_title",
+    "mcp__codex_tui__set_thread_title",
+    "codex_tui__set_thread_title",
+    # Dynamic-tool Hook names concatenate namespace and name without __.
+    "codex_appset_thread_title",
+    "codex_tuiset_thread_title",
+)
 
 SectionDomainMap = tuple[tuple[str, str], ...]
 SectionCapacity = tuple[bool, int, str]
@@ -434,6 +443,9 @@ def _default_state(checkpoints: tuple[int, ...]) -> dict[str, Any]:
         "checkpoint_signature": list(checkpoints),
         "pending_title_tool_completions": [],
         "title_tool_completion_observations": [],
+        "title_tool_results": [],
+        "title_write_confirmed": False,
+        "stop_recovery_turn_token": None,
     }
 
 
@@ -497,7 +509,23 @@ def _load_state(path: Path, checkpoints: tuple[int, ...]) -> dict[str, Any]:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeError):
         return _default_state(checkpoints)
-    if not isinstance(loaded, dict) or loaded.get("schema_version") not in (2, 3, 4, 5):
+    return _normalize_state(loaded, checkpoints)
+
+
+def _title_tool_results(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        {"turn_token": item["turn_token"], "success": item["success"]}
+        for item in value
+        if isinstance(item, dict)
+        and _is_digest(item.get("turn_token"))
+        and isinstance(item.get("success"), bool)
+    ][-MAX_SEEN_TURNS:]
+
+
+def _normalize_state(loaded: Any, checkpoints: tuple[int, ...]) -> dict[str, Any]:
+    if not isinstance(loaded, dict) or loaded.get("schema_version") not in (2, 3, 4, 5, 6, 7):
         return _default_state(checkpoints)
 
     state = _default_state(checkpoints)
@@ -507,7 +535,7 @@ def _load_state(path: Path, checkpoints: tuple[int, ...]) -> dict[str, Any]:
 
     previous_signature = (
         _normalize_checkpoints(loaded.get("checkpoint_signature"))
-        if loaded.get("schema_version") == SCHEMA_VERSION
+        if loaded.get("schema_version") in (5, 6, 7)
         else None
     )
     if previous_signature != checkpoints:
@@ -520,74 +548,27 @@ def _load_state(path: Path, checkpoints: tuple[int, ...]) -> dict[str, Any]:
         )
 
     state["fired_thresholds"] = sorted(fired)
-    if loaded.get("schema_version") == SCHEMA_VERSION:
+    if loaded.get("schema_version") in (5, 6, 7):
         state["pending_title_tool_completions"] = _checkpoint_turn_records(
             loaded.get("pending_title_tool_completions")
         )
         state["title_tool_completion_observations"] = _checkpoint_turn_records(
             loaded.get("title_tool_completion_observations")
         )
+    if loaded.get("schema_version") in (6, 7):
+        state["title_tool_results"] = _title_tool_results(loaded.get("title_tool_results"))
+        state["title_write_confirmed"] = loaded.get("title_write_confirmed") is True
+        recovery_turn = loaded.get("stop_recovery_turn_token")
+        if _is_digest(recovery_turn):
+            state["stop_recovery_turn_token"] = recovery_turn
+    if state["prompt_count"] >= checkpoints[-1] and (
+        loaded.get("schema_version") != SCHEMA_VERSION
+        or previous_signature != checkpoints
+    ):
+        # Earlier versions did not require a receipt at the final checkpoint.
+        # A success from prompt 2 cannot retire a task already past prompt 10.
+        state["title_write_confirmed"] = False
     return state
-
-
-def _write_state(path: Path, state: dict[str, Any]) -> None:
-    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(state, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
-
-
-def _try_lock(handle: Any) -> bool:
-    handle.seek(0)
-    if os.name == "nt":
-        import msvcrt
-
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-
-    import fcntl
-
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-
-
-def _unlock(handle: Any) -> None:
-    handle.seek(0)
-    if os.name == "nt":
-        import msvcrt
-
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
-def _state_lock(path: Path) -> Iterator[None]:
-    with path.open("a+b") as handle:
-        if path.stat().st_size == 0:
-            handle.write(b"0")
-            handle.flush()
-        for _ in range(50):
-            if _try_lock(handle):
-                break
-            time.sleep(0.02)
-        else:
-            raise TimeoutError("could not acquire title checkpoint state lock")
-        try:
-            yield
-        finally:
-            _unlock(handle)
 
 
 def _section_routing_context(
@@ -719,16 +700,21 @@ def _checkpoint_context(
     position = checkpoints.index(threshold)
     if position == 0:
         checkpoint_action = "Set a useful current-task title at this initial checkpoint."
-    elif position == len(checkpoints) - 1:
-        checkpoint_action = (
-            "This is the final refresh checkpoint. Rename only when the project, work "
-            "type, concrete object, or purpose changed materially; otherwise skip."
-        )
     else:
         checkpoint_action = (
             "This is a refinement checkpoint. Rename only when the current title is "
             "missing or inaccurate, or the object and purpose can now be stated "
             "materially more clearly; otherwise skip."
+        )
+    if position == len(checkpoints) - 1:
+        checkpoint_action = (
+            "Set a useful current-task title at this initial checkpoint. "
+            if position == 0 else ""
+        ) + (
+            "This is the final refresh checkpoint. Review the current project, work "
+            "type, concrete object, and purpose, then set the intended title once "
+            "even if its wording is unchanged. A successful receipt completes title "
+            "maintenance for this task; do not skip this confirmation."
         )
 
     schedule = ",".join(str(item) for item in checkpoints)
@@ -795,10 +781,10 @@ def _handle_user_prompt(
 
     seen.append(turn_token)
     state["seen_turns"] = seen[-MAX_SEEN_TURNS:]
-    # A PostToolUse completion can only be attributed to the foreground turn
-    # that emitted the checkpoint. Once a new user turn begins, do not infer
-    # that an earlier missing completion was an error or an unchanged title.
+    # User prompts count checkpoints; resumed turns do not add to that count.
+    # Results not consumed by Stop belong to the previous interaction.
     state["pending_title_tool_completions"] = []
+    state["title_tool_results"] = []
     state["prompt_count"] = _nonnegative_int(state.get("prompt_count")) + 1
 
     fired = _threshold_set(state.get("fired_thresholds"))
@@ -812,6 +798,10 @@ def _handle_user_prompt(
         return None
 
     threshold = eligible[0]
+    # Only an emitted checkpoint grants another automatic recovery attempt.
+    state["stop_recovery_turn_token"] = None
+    if threshold == checkpoints[-1]:
+        state["title_write_confirmed"] = False
     fired.add(threshold)
     state["fired_thresholds"] = sorted(fired)
     pending = _checkpoint_turn_records(
@@ -837,21 +827,78 @@ def _handle_user_prompt(
     )
 
 
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def _title_receipt(value: Any) -> dict[str, Any] | None:
+    """Accept the native result or the documented MCP structured/text envelope."""
+    result = _json_object(value)
+    if result is None or result.get("isError") is True or result.get("error") is not None:
+        return None
+    if "structuredContent" in result:
+        result = _json_object(result["structuredContent"])
+    elif "content" in result:
+        content = result["content"]
+        if (
+            not isinstance(content, list)
+            or len(content) != 1
+            or not isinstance(content[0], dict)
+            or content[0].get("type") != "text"
+        ):
+            return None
+        result = _json_object(content[0].get("text"))
+    if result is None or result.get("isError") is True or result.get("error") is not None:
+        return None
+    return result
+
+
 def _handle_title_tool_completion(payload: dict[str, Any], state: dict[str, Any]) -> bool:
-    """Record only a matching PostToolUse completion, never its title payload."""
-    if payload.get("tool_name") != TITLE_TOOL_NAME:
+    """Verify the current task's write and save its result for that turn's Stop."""
+    if payload.get("tool_name") not in TITLE_TOOL_NAMES:
         return False
 
+    arguments = _json_object(payload.get("tool_input"))
+    session_id = payload.get("session_id")
+    if (
+        arguments is None
+        or not isinstance(session_id, str)
+        or not session_id
+        or arguments.get("source", "codex") != "codex"
+        or arguments.get("threadId") not in (None, session_id)
+        or not isinstance(arguments.get("title"), str)
+        or not arguments["title"].strip()
+    ):
+        return False
     turn_id = payload.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id:
         return False
     turn_token = _digest(turn_id)
 
+    receipt = _title_receipt(payload.get("tool_response"))
+    success = (
+        receipt is not None
+        and receipt.get("threadId") == session_id
+        and receipt.get("title") == arguments["title"]
+    )
+    results = [
+        record for record in state["title_tool_results"]
+        if record["turn_token"] != turn_token
+    ]
+    results.append({"turn_token": turn_token, "success": success})
+    state["title_tool_results"] = results[-MAX_SEEN_TURNS:]
+    # Preserve early confirmation if a new user message interrupts before Stop.
+    # Final confirmation still belongs to the actual stopping turn.
+    if state["prompt_count"] < state["checkpoint_signature"][-1]:
+        state["title_write_confirmed"] = success
+
     pending = _checkpoint_turn_records(state.get("pending_title_tool_completions"))
     matched = [record for record in pending if record["turn_token"] == turn_token]
-    if not matched:
-        return False
-
     observations = _checkpoint_turn_records(
         state.get("title_tool_completion_observations")
     )
@@ -867,6 +914,65 @@ def _handle_title_tool_completion(payload: dict[str, Any], state: dict[str, Any]
     return True
 
 
+def _handle_stop(
+    payload: dict[str, Any], state: dict[str, Any], checkpoints: tuple[int, ...]
+) -> dict[str, Any] | None:
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    turn_token = _digest(turn_id)
+    # Stop identifies the actual foreground turn, including a continuation
+    # without UserPromptSubmit. Other turns' late receipts cannot confirm it.
+    results = state["title_tool_results"]
+    for record in results:
+        if record["turn_token"] == turn_token:
+            state["title_write_confirmed"] = record["success"]
+    state["title_tool_results"] = [
+        record for record in results if record["turn_token"] != turn_token
+    ]
+    checkpoint_records = (
+        state["pending_title_tool_completions"]
+        + state["title_tool_completion_observations"]
+    )
+    if (
+        state["title_write_confirmed"]
+        or state["prompt_count"] not in checkpoints
+        # Schedule changes mark past thresholds as fired without emitting them.
+        or not any(
+            record["checkpoint"] == state["prompt_count"]
+            for record in checkpoint_records
+        )
+    ):
+        return None
+    if payload.get("stop_hook_active") is True:
+        if state["stop_recovery_turn_token"] == turn_token:
+            return {
+                "systemMessage": (
+                    "Title confirmation is incomplete; retry at a later checkpoint or manually."
+                )
+            }
+        return None
+    if (
+        payload.get("stop_hook_active") is not False
+        or state["stop_recovery_turn_token"] is not None
+    ):
+        return None
+
+    state["stop_recovery_turn_token"] = turn_token
+    skill_path = (
+        Path(__file__).resolve().parents[1]
+        / "skills" / "organize-codex-task-titles" / "SKILL.md"
+    )
+    return {
+        "decision": "block",
+        "reason": (
+            "Use the current context to run "
+            "[$codex-task-title-organizer:organize-codex-task-titles]"
+            f"({skill_path.as_posix()})"
+        ),
+    }
+
+
 def main() -> int:
     data_root_text = os.environ.get("PLUGIN_DATA")
     if not data_root_text:
@@ -877,8 +983,16 @@ def main() -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
+    # Codex includes these fields only for hooks running inside a subagent.
+    # Skip before loading configuration or opening the state database.
+    if payload.get("agent_id") or payload.get("agent_type"):
+        return 0
+    # Ephemeral side chats have no transcript path and cannot be renamed.
+    # Check only the metadata; never open or persist the transcript path.
+    if payload.get("transcript_path") is None:
+        return 0
     event_name = payload.get("hook_event_name")
-    if event_name not in ("UserPromptSubmit", "PostToolUse"):
+    if event_name not in ("UserPromptSubmit", "PostToolUse", "Stop"):
         return 0
 
     session_id = payload.get("session_id")
@@ -891,52 +1005,79 @@ def main() -> int:
         if not enabled:
             return 0
         session_key = _digest(session_id)
-        state_path = data_root / f"{session_key}.json"
-        lock_path = data_root / f"{session_key}.lock"
-
-        if event_name == "PostToolUse":
-            if payload.get("tool_name") != TITLE_TOOL_NAME or not state_path.is_file():
-                return 0
-            with _state_lock(lock_path):
-                state = _load_state(state_path, checkpoints)
-                if _handle_title_tool_completion(payload, state):
-                    _write_state(state_path, state)
+        legacy_path = data_root / f"{session_key}.json"
+        database_path = data_root / STATE_DATABASE_NAME
+        if event_name == "PostToolUse" and payload.get("tool_name") not in TITLE_TOOL_NAMES:
+            return 0
+        if event_name != "UserPromptSubmit" and not (
+            database_path.is_file() or legacy_path.is_file()
+        ):
+            if event_name == "Stop":
+                print("{}")
             return 0
 
-        (
-            section_routing_enabled,
-            section_prefix,
-            create_missing_sections,
-            allowed_domains,
-            section_domain_map,
-            max_sections,
-            section_capacity,
-            section_routing_source,
-        ) = _load_section_routing(payload, data_root)
         data_root.mkdir(parents=True, exist_ok=True)
         output: dict[str, Any] | None = None
-        with _state_lock(lock_path):
-            state = _load_state(state_path, checkpoints)
-            output = _handle_user_prompt(
-                payload,
-                state,
-                checkpoints,
-                config_source,
-                section_routing_enabled,
-                section_prefix,
-                create_missing_sections,
-                allowed_domains,
-                section_domain_map,
-                max_sections,
-                section_capacity,
-                section_routing_source,
+        with closing(sqlite3.connect(database_path, timeout=1.0)) as database:
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "session_key TEXT PRIMARY KEY, done INTEGER NOT NULL, state_json TEXT, "
+                "CHECK ((done = 0 AND state_json IS NOT NULL) "
+                "OR (done = 1 AND state_json IS NULL)))"
             )
-            _write_state(state_path, state)
-        if output is not None:
+            with database:
+                # Serialize the complete read/modify/write, including first import.
+                database.execute("BEGIN IMMEDIATE")
+                row = database.execute(
+                    "SELECT done, state_json FROM sessions WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()
+                if row is not None and row[0]:
+                    if event_name == "Stop":
+                        print("{}")
+                    return 0
+                if row is None:
+                    if event_name != "UserPromptSubmit" and not legacy_path.is_file():
+                        if event_name == "Stop":
+                            print("{}")
+                        return 0
+                    # Legacy files remain untouched for rollback. Once imported,
+                    # SQLite is authoritative even if an old Hook writes JSON.
+                    state = _load_state(legacy_path, checkpoints)
+                else:
+                    state = _normalize_state(json.loads(row[1]), checkpoints)
+
+                done = False
+                if event_name == "PostToolUse":
+                    if not _handle_title_tool_completion(payload, state):
+                        return 0
+                elif event_name == "Stop":
+                    output = _handle_stop(payload, state, checkpoints)
+                    done = (
+                        state["title_write_confirmed"]
+                        and state["prompt_count"] >= checkpoints[-1]
+                    )
+                else:
+                    output = _handle_user_prompt(
+                        payload, state, checkpoints, config_source,
+                        *_load_section_routing(payload, data_root),
+                    )
+
+                state_text = None if done else json.dumps(
+                    state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                if row is None or row != (int(done), state_text):
+                    database.execute(
+                        "INSERT INTO sessions (session_key, done, state_json) VALUES (?, ?, ?) "
+                        "ON CONFLICT(session_key) DO UPDATE SET "
+                        "done = excluded.done, state_json = excluded.state_json",
+                        (session_key, int(done), state_text),
+                    )
+        if output is not None or event_name == "Stop":
             # ASCII output is portable on Windows legacy consoles; JSON parsing
             # restores the original Unicode title instructions.
-            print(json.dumps(output, ensure_ascii=True, separators=(",", ":")))
-    except (OSError, TimeoutError, ValueError, TypeError):
+            print(json.dumps(output or {}, ensure_ascii=True, separators=(",", ":")))
+    except (OSError, sqlite3.Error, ValueError, TypeError):
         # Hooks must fail open: title maintenance is secondary to the user task.
         return 0
     return 0

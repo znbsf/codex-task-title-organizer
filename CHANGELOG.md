@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Restrict automatic title maintenance to persistent main tasks; skip subagent
+  and ephemeral side-chat events before loading configuration or accessing state.
+- Verify current-task title writes from Codex App and TUI tools, including native,
+  MCP, and flattened dynamic-tool names and JSON or MCP response envelopes.
+- Add at most one Stop recovery per emitted checkpoint when a required write is
+  unconfirmed. Missing tools or failed recovery wait for a later checkpoint or
+  manual title write instead of prompting again on subsequent turns.
+  A successful receipt lets the actual stopping turn finish, including resumed
+  turns without a new user prompt. Recovery links directly to the installed skill.
+- Require a confirming write at the final checkpoint, even for an unchanged
+  title. After Stop confirms it, later Hooks skip maintenance for that task.
+- Store bounded counters and confirmation flags in the plugin's own SQLite
+  database. Import legacy JSON lazily, preserve it for rollback, and retain only
+  a completion marker after the final check succeeds.
+- Document Hook trust review and configuration refresh in the app-server hosting
+  an existing task so upgrades reach the process that runs its Hooks.
 - Add optional, bounded `sectionCapacity` retention: route the current task to
   the top, keep a configured maximum, and return confirmed Codex overflow tasks
   to the default Tasks area without deleting or archiving them.

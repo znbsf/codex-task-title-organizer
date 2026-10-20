@@ -3,15 +3,16 @@
 A standalone Codex plugin for keeping task titles compact, searchable, visually
 consistent, and tied to the right project or repository.
 
-The plugin bundles one skill, a privacy-conscious `UserPromptSubmit` Hook, and
-one narrowly matched `PostToolUse` observer:
+The plugin bundles one skill and three privacy-conscious Hooks:
 
 - prompt 2 asks the active Codex turn to establish a useful title;
 - prompt 4 refines it only when clearer task context is available;
-- prompt 10 refreshes it only when the project, object, or purpose changed materially;
+- prompt 10 confirms the intended title once, even when its wording is unchanged;
 - the Hook never reads or persists prompt text;
-- the observer records only that the current title tool completed after a
-  checkpoint; it never reads the requested title or tool result;
+- `PostToolUse` verifies the current task's title-tool receipt in memory without
+  retaining the requested or returned title;
+- `Stop` requests at most one recovery continuation per checkpoint when a title
+  write is due but has not been confirmed;
 - old tasks can still be normalized manually in batches of at most 10.
 
 ## Title standard
@@ -58,24 +59,91 @@ counts unique prompts, then adds a narrowly scoped developer instruction to the
 same foreground turn. The active Codex turn uses the public current-task title
 tool, without a thread ID, after finishing the user's main request.
 
-State is stored under Codex's plugin data directory and contains only:
+Automatic title maintenance applies only to the main agent of a persistent task.
+Hook events carrying Codex's subagent identity fields (`agent_id` or `agent_type`)
+or a null or missing `transcript_path` return before loading configuration or
+opening the state database.
+Codex supplies a null transcript path for ephemeral side chats, which cannot be
+renamed. The Hook checks only whether this metadata is present; it never reads
+the transcript or stores its path. Skipped events do not count prompts, record
+title receipts, or request recovery, even if an older version already created
+state. The plugin does not register a `SubagentStop` handler. The skill also tells
+subagents and side chats to skip inherited title-maintenance instructions.
 
-- a SHA-256 hash of the session ID in the filename;
+State is stored in `PLUGIN_DATA/title-state.sqlite3`, using Python's standard
+library SQLite driver. One `sessions` row per task contains `session_key`, `done`,
+and `state_json`. SQLite transactions serialize concurrent Hook updates; new
+tasks no longer create individual JSON or lock files. Active state contains only:
+
+- a SHA-256 hash of the session ID as the primary key;
 - SHA-256 hashes of recently seen turn IDs and checkpoint turns awaiting the
   current foreground turn's title-tool completion;
 - the prompt count, emitted checkpoints, and a bounded set of matching title-tool
-  completion observations.
+  completion observations;
+- a bounded list of turn hashes with each turn's last title-write result;
+- a title-write confirmation flag and the hashed turn ID of the current
+  checkpoint's Stop recovery, if used.
 
 It stores no generated titles, prompt excerpts, transcripts, rollout data,
-database content, full user paths, or project taxonomy.
+Codex database content, full user paths, or project taxonomy.
 
 `fired_thresholds` means only that the `UserPromptSubmit` Hook emitted checkpoint
-context. A matching `PostToolUse` event is reported separately as **title tool
-completion observed**. It is not evidence that a title changed, and a missing
-completion is not recorded as an error: a `PostToolUse` Hook does not distinguish
-no call, a failed call, an untrusted Hook, or an unsupported tool path. The
-observer matches only `mcp__codex_app__set_thread_title` and never inspects its
-input or response.
+context. Completion observations remain separate from success. The observer
+matches `codex_app__set_thread_title`, `codex_tui__set_thread_title`, and their
+MCP-prefixed forms. It also accepts the flattened dynamic-tool Hook names
+`codex_appset_thread_title` and `codex_tuiset_thread_title`: Codex can omit the
+separator shown by code mode when emitting `PostToolUse`.
+It confirms a write only when the call targets the current Codex task, the result
+has no error, the returned `threadId` equals the Hook's `session_id`, and the
+returned title equals the requested title. Native JSON results and MCP structured
+or single-text JSON results are supported. An identical title counts as confirmed;
+the Hook verifies the requested value was set, not that the text changed.
+
+The observer saves the latest success or failure for each turn. `Stop` consumes
+its own turn's result before deciding whether a recovery is needed, so a
+successful write directly allows the turn to finish. This includes resumed turns
+that have no new user prompt and therefore do not increment the checkpoint
+counter. Another turn's delayed receipt cannot confirm the stopping turn's final
+check. Before the final checkpoint, the confirmation flag is also updated when
+the receipt arrives, so a new user message interrupting before Stop does not lose
+an initial successful write. Results are capped at 64 turns, consumed by the
+matching Stop, and cleared when a new user interaction begins. Existing schema
+version 7 state remains readable.
+
+At an emitted checkpoint, `Stop` can recover a missing first confirmation, a
+failed title write, or a missing final confirmation. It does not force an
+optional intermediate refinement after a title has been confirmed. Each
+checkpoint allows one automatic recovery continuation, using the same current
+task and the public title tool. The saved recovery turn ID remains set until
+another checkpoint is emitted, so resumed turns cannot renew that allowance.
+If the tool is unavailable or recovery fails, the turn ends normally and
+automatic attempts wait for the next checkpoint. An interrupted checkpoint also
+waits for the next checkpoint once a new user prompt begins. Manual title writes
+can still be confirmed between checkpoints. Idle tasks are never scanned.
+
+Codex displays Stop continuation feedback in the chat. The Hook emits one short
+instruction linking to the installed title skill; detailed instructions stay in
+the skill's Current-task checkpoint mode. The skill ends a successful recovery
+without a separate title-update announcement. This reduces visible noise; it
+does not hide Codex's hook-feedback message.
+
+The last configured checkpoint (10 by default) always requests a confirming
+write, even if the title is unchanged. Earlier success does not satisfy this
+final check. After Stop confirms a successful current-turn receipt at or after
+that checkpoint, the row becomes `done = 1, state_json = NULL`: counters and turn
+records are removed. Later Hooks return without changing it or restarting checkpoints,
+including after a configuration change. After the final checkpoint's recovery
+is exhausted, a later manual write can complete confirmation. SQLite reuses
+freed space; it does not run a full database compaction on every Hook.
+
+The Hook imports the current task's legacy JSON state on its first event, keeping
+its counters and emitted checkpoints. Old files remain untouched as rollback
+data, and SQLite is authoritative after import. No idle tasks are scanned.
+Older tasks already past the final checkpoint need one fresh manual
+confirmation; an old success flag does not establish that the final check
+completed. A suitable title can be submitted unchanged. Rolling back to the
+JSON-based version uses the old snapshot (new tasks restart counting); it does
+not undo written titles.
 
 ## Route renamed tasks to sidebar sections
 
@@ -152,8 +220,8 @@ codex plugin marketplace add znbsf/codex-task-title-organizer --ref main
 codex plugin add codex-task-title-organizer@codex-task-title-organizer
 ```
 
-Restart or refresh Codex, open `/hooks`, inspect the exact `UserPromptSubmit` and
-`PostToolUse` commands, and trust them.
+Restart or refresh Codex, open `/hooks`, inspect the exact `UserPromptSubmit`,
+`PostToolUse`, and `Stop` commands, and trust them.
 Automatic checkpoints are not active until that user review is complete.
 
 ## Install from a local checkout or ZIP

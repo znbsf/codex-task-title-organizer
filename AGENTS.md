@@ -8,9 +8,10 @@ marketplace entry.
 - Keep the public package domain-neutral and privacy-conscious.
 - Private projects without Jira or Gerrit must fall back to a project name,
   repository name, or `cwd` basename; never generate a placeholder identifier.
-- The Hook may persist only hashed session/turn identifiers and small counters.
-  It must not read or persist prompt text, transcripts, rollouts, databases, or
-  full paths.
+- The Hook may persist only hashed session/turn identifiers, small counters, and
+  completion flags in its own SQLite database under `PLUGIN_DATA`. It may import
+  its legacy JSON state. It must not read or persist prompt text, transcripts,
+  rollouts, Codex databases, or full paths.
 - Keep current-task Hook behavior separate from cross-task batch maintenance.
 - Sidebar routing is opt-in and must use only a successful current title result
   plus sidebar section metadata. It may create a section only for an explicit,

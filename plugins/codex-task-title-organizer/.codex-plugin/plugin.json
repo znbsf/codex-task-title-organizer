@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Codex Task Title Organizer",
     "shortDescription": "Project-aware titles with optional sidebar grouping",
-    "longDescription": "Bundles a title-standardization skill with color-block, semantic-icon, and custom marker styles plus a configurable, privacy-conscious UserPromptSubmit hook. It can optionally route successfully renamed Codex tasks into bounded, allowlisted Domain sidebar sections.",
+    "longDescription": "Bundles a title-standardization skill with configurable UserPromptSubmit checkpoints, verified title-tool receipts, and one Stop recovery per turn. SQLite retains only a completion marker after the final confirmed check. It supports color-block, semantic-icon, and custom styles plus optional bounded Domain sidebar routing.",
     "developerName": "znbsf",
     "category": "Productivity",
     "capabilities": [
