@@ -111,7 +111,9 @@ def state_text_for(data_dir: str, session_id: str = "thr-test") -> str:
     return row[1]
 
 
-def stop_payload(number: int, *, active: bool = False) -> dict[str, object]:
+def stop_payload(
+    number: int, *, active: bool = False, last_message: str | None = None
+) -> dict[str, object]:
     return {
         "session_id": "thr-test",
         "transcript_path": "/unavailable/synthetic-transcript.jsonl",
@@ -119,7 +121,7 @@ def stop_payload(number: int, *, active: bool = False) -> dict[str, object]:
         "cwd": str(REPO_ROOT),
         "hook_event_name": "Stop",
         "stop_hook_active": active,
-        "last_assistant_message": "secret assistant message",
+        "last_assistant_message": last_message,
     }
 
 
@@ -361,6 +363,71 @@ class TitleTurnTriggerTests(unittest.TestCase):
                 run_hook(data_dir, post_tool_payload(2, tool_name="Bash")), ""
             )
             self.assertEqual(state_text_for(data_dir), before)
+
+    def test_answered_checkpoint_does_not_restart_title_maintenance(self) -> None:
+        for checkpoint in (2, 4, 10):
+            for failed_write in (False, True):
+                with self.subTest(checkpoint=checkpoint, failed_write=failed_write):
+                    with tempfile.TemporaryDirectory() as data_dir:
+                        for number in range(1, checkpoint + 1):
+                            run_hook(data_dir, prompt_payload(number))
+                        if failed_write:
+                            failed = post_tool_payload(checkpoint)
+                            failed["tool_response"] = {"isError": True}
+                            run_hook(data_dir, failed)
+                        answer = "Synthetic completed task answer"
+                        self.assertEqual(json.loads(run_hook(
+                            data_dir, stop_payload(checkpoint, last_message=answer)
+                        )), {})
+                        # Resuming without a new user prompt must not reopen the
+                        # answered checkpoint after the message leaves the payload.
+                        self.assertEqual(json.loads(run_hook(
+                            data_dir, stop_payload(checkpoint + 100)
+                        )), {})
+                        state_text = state_text_for(data_dir)
+                        state = json.loads(state_text)
+                        self.assertFalse(state["title_write_confirmed"])
+                        self.assertEqual(state["prompt_count"], checkpoint)
+                        self.assertNotIn(answer, state_text)
+
+    def test_answered_checkpoint_defers_recovery_until_next_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as data_dir:
+            run_hook(data_dir, prompt_payload(1))
+            run_hook(data_dir, prompt_payload(2))
+            self.assertEqual(json.loads(run_hook(
+                data_dir, stop_payload(2, last_message="Synthetic completed answer")
+            )), {})
+            self.assertEqual(json.loads(run_hook(
+                data_dir, stop_payload(2, active=True, last_message="Synthetic completed answer")
+            )), {})
+            run_hook(data_dir, prompt_payload(3))
+            self.assertEqual(json.loads(run_hook(data_dir, stop_payload(3))), {})
+            run_hook(data_dir, prompt_payload(4))
+            self.assertEqual(json.loads(run_hook(data_dir, stop_payload(4)))["decision"], "block")
+
+    def test_answered_stop_still_confirms_successful_title_receipt(self) -> None:
+        for checkpoint in (2, 10):
+            with self.subTest(checkpoint=checkpoint), tempfile.TemporaryDirectory() as data_dir:
+                for number in range(1, checkpoint + 1):
+                    run_hook(data_dir, prompt_payload(number))
+                run_hook(data_dir, post_tool_payload(checkpoint))
+                self.assertEqual(json.loads(run_hook(
+                    data_dir, stop_payload(checkpoint, last_message="Synthetic completed answer")
+                )), {})
+                if checkpoint == 10:
+                    self.assertEqual(state_row_for(data_dir), (1, None))
+                else:
+                    self.assertTrue(json.loads(state_text_for(data_dir))["title_write_confirmed"])
+
+    def test_unanswered_checkpoint_retains_bounded_recovery(self) -> None:
+        for last_message in (None, "", " \n\t"):
+            with self.subTest(message=last_message), tempfile.TemporaryDirectory() as data_dir:
+                run_hook(data_dir, prompt_payload(1))
+                run_hook(data_dir, prompt_payload(2))
+                self.assertEqual(json.loads(run_hook(
+                    data_dir, stop_payload(2, last_message=last_message)
+                ))["decision"], "block")
+                self.assertEqual(json.loads(run_hook(data_dir, stop_payload(2))), {})
 
     def test_stop_recovers_missed_write_once_and_preserves_prompt_count(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:

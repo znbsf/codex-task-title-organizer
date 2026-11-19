@@ -6,7 +6,10 @@ The Hook defaults to checkpoints `2, 4, 10`:
 - `4`: refine only when the title is missing, inaccurate, or materially clearer;
 - `10`: review and confirm the intended title, writing the same value if unchanged.
 
-The Stop Hook can request one recovery continuation at each emitted checkpoint.
+The Stop Hook can request one recovery continuation at each emitted checkpoint
+while no nonblank assistant answer has been delivered. If an answer is already
+present, it lets the turn finish and defers recovery until the next checkpoint,
+including across resumed turns. The answer text is never persisted.
 If the title tool is unavailable or the write fails, the turn ends normally;
 automatic recovery waits for the next checkpoint. Resumed turns share the same
 allowance. Between checkpoints, title writes can be triggered manually and their

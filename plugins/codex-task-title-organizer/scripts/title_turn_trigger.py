@@ -732,9 +732,9 @@ def _checkpoint_context(
         "Codex Task Title Organizer checkpoint: this is user prompt "
         f"{prompt_count} observed after the plugin was enabled (checkpoint "
         f"{threshold}; configured schedule {schedule}; source {config_source}). "
-        f"{checkpoint_action} Finish the user's main request first, then explicitly "
+        f"{checkpoint_action} Finish the user's main work first, then explicitly "
         "use $organize-codex-task-titles in Current-task checkpoint mode before "
-        "ending this same foreground turn. Generate the title only from current-task "
+        "sending the final reply in this same foreground turn. Generate the title only from current-task "
         "context using `Marker Domain｜Project/repository key｜Work type｜Concrete "
         "object: purpose or symptom`, matching the task language. Honor an explicit "
         "marker style or active project instruction; otherwise preserve an already valid "
@@ -943,6 +943,13 @@ def _handle_stop(
             for record in checkpoint_records
         )
     ):
+        return None
+    last_message = payload.get("last_assistant_message")
+    if isinstance(last_message, str) and last_message.strip():
+        # Reopening an answered turn for title maintenance can leave an empty
+        # final answer after the real reply. Defer this checkpoint's recovery,
+        # including resumed turns, until the next emitted checkpoint.
+        state["stop_recovery_turn_token"] = state["stop_recovery_turn_token"] or turn_token
         return None
     if payload.get("stop_hook_active") is True:
         if state["stop_recovery_turn_token"] == turn_token:

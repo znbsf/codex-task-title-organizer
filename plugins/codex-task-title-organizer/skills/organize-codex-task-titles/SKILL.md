@@ -86,8 +86,8 @@ Never infer a client identity, project name, or issue key from unrelated tasks.
 ## Current-task checkpoint mode
 
 When Hook context requests a plugin checkpoint or a title-confirmation recovery,
-finish the user's main request first, then run this section before ending the
-same foreground turn. Do not enter the batch workflow:
+finish the user's main work first, then run this section before sending the
+final reply in the same foreground turn. Do not enter the batch workflow:
 
 1. Generate the title only from the current task context. Do not call
    `list_threads`, `read_thread`, or an automation tool, except for the narrow
@@ -116,8 +116,10 @@ the intended title already matches the existing wording. This confirms the
 requested value and overrides the optional refinement skip above.
 Verify the tool returned the current task ID and intended title. If the call
 fails, report the failure briefly and finish; do not retry or restart the main
-request in that continuation. After success, end without a separate
-title-maintenance announcement. The Hook stores counters and confirmation flags
+request in that continuation. After title maintenance, deliver any outstanding
+user-facing answer. Title maintenance needs no separate announcement or empty
+final reply. The Hook defers automatic recovery when an assistant answer has
+already been delivered. It stores counters and confirmation flags
 in its own SQLite database, never title text. After the final required write
 succeeds, it clears the detailed state and retains only a completion marker.
 
