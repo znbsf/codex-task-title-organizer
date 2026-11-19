@@ -12,7 +12,7 @@ The plugin bundles one skill and three privacy-conscious Hooks:
 - `PostToolUse` verifies the current task's title-tool receipt in memory without
   retaining the requested or returned title;
 - `Stop` requests at most one recovery continuation per checkpoint when a title
-  write is due but has not been confirmed;
+  write is due, has not been confirmed, and no assistant answer has been delivered;
 - old tasks can still be normalized manually in batches of at most 10.
 
 ## Title standard
@@ -57,7 +57,8 @@ exists.
 The command Hook does not rename a task by reaching into Codex internals. It
 counts unique prompts, then adds a narrowly scoped developer instruction to the
 same foreground turn. The active Codex turn uses the public current-task title
-tool, without a thread ID, after finishing the user's main request.
+tool, without a thread ID, after finishing the user's main work and before
+sending the final reply.
 
 Automatic title maintenance applies only to the main agent of a persistent task.
 Hook events carrying Codex's subagent identity fields (`agent_id` or `agent_type`)
@@ -81,8 +82,8 @@ tasks no longer create individual JSON or lock files. Active state contains only
 - the prompt count, emitted checkpoints, and a bounded set of matching title-tool
   completion observations;
 - a bounded list of turn hashes with each turn's last title-write result;
-- a title-write confirmation flag and the hashed turn ID of the current
-  checkpoint's Stop recovery, if used.
+- a title-write confirmation flag and the hashed turn ID where the current
+  checkpoint's Stop recovery was used or deferred.
 
 It stores no generated titles, prompt excerpts, transcripts, rollout data,
 Codex database content, full user paths, or project taxonomy.
@@ -116,6 +117,12 @@ optional intermediate refinement after a title has been confirmed. Each
 checkpoint allows one automatic recovery continuation, using the same current
 task and the public title tool. The saved recovery turn ID remains set until
 another checkpoint is emitted, so resumed turns cannot renew that allowance.
+If `last_assistant_message` contains a nonblank answer, Stop lets the turn finish
+and defers automatic recovery until the next checkpoint. It still consumes
+successful title receipts and can retire the final checkpoint. This avoids
+reopening a completed answer for title maintenance and leaving a later empty
+final reply that can hide the answer in summarized history. The answer is checked
+only in memory and is never stored.
 If the tool is unavailable or recovery fails, the turn ends normally and
 automatic attempts wait for the next checkpoint. An interrupted checkpoint also
 waits for the next checkpoint once a new user prompt begins. Manual title writes
@@ -123,9 +130,9 @@ can still be confirmed between checkpoints. Idle tasks are never scanned.
 
 Codex displays Stop continuation feedback in the chat. The Hook emits one short
 instruction linking to the installed title skill; detailed instructions stay in
-the skill's Current-task checkpoint mode. The skill ends a successful recovery
-without a separate title-update announcement. This reduces visible noise; it
-does not hide Codex's hook-feedback message.
+the skill's Current-task checkpoint mode. After title maintenance, the skill
+delivers any outstanding user-facing answer without a separate title-update
+announcement or empty final reply. Codex's hook-feedback message remains visible.
 
 The last configured checkpoint (10 by default) always requests a confirming
 write, even if the title is unchanged. Earlier success does not satisfy this
